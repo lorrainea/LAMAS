@@ -1,4 +1,7 @@
 #include <stdio.h>
+#include <set>
+#include <cstring>
+#include <unistd.h>
 #include <stdlib.h>
 #include <fstream>
 #include <sstream>
@@ -55,46 +58,50 @@ int64_t LCParray ( unsigned char * text, int64_t n, int64_t * SA, int64_t * ISA,
 }
 
 
-int compute_delta(int * delta, int * li, int * rp, int * rs, int64_t * SA, int64_t * invSA, int64_t * LCP, int seq_x_len, int seq_y_len, int seq_xy_len)
+int compute_delta(rmq_succinct_sct<> &rmq, int &delta, int &li, int rp, int rs, int64_t * SA, int64_t * invSA, int64_t * LCP, int seq_x_len, int seq_y_len, int seq_xy_len, int i)
 {
 
-    int * lp = new int[seq_y_len];
-    int * ls = new int[seq_y_len];
+    int lp = 0;
+    int ls = 0;
     
-    int_vector<> lcp_rmq( seq_xy_len , 0 );
-
-	for ( int i = 0; i < seq_xy_len; i ++ )
-	{
-		lcp_rmq[i] = LCP[i];
-	}
-	
-	rmq_succinct_sct<> rmq(&lcp_rmq);
-    
-    for(int i = seq_x_len+1;  i<seq_xy_len; i++)
+    int index = i-(seq_x_len+1);
+        
+    if( rp == -1 )
+        lp = INT_MIN;
+        
+    if( rs == -1 )
+        ls = INT_MIN;
+            
+    if( rp > -1 )
     {
-        int index = i-(seq_x_len+1);
-        
-        if( rp[index] == -1 )
-            lp[index] = INT_MIN;
-        
-        if( rs[index] == -1 )
-            ls[index] = INT_MIN;
-            
-        if( rp[index] > -1 )
-        {
-            lp[index] = lcp_rmq[rmq ( min((int)invSA[i],rp[index])+1, max(rp[index],(int)invSA[i]) )];
-        }
-            
-        if( rs[index] > -1 )
-        {
-            ls[index] = lcp_rmq[rmq ( min((int)invSA[i],rs[index])+1, max(rs[index],(int)invSA[i]) )];
-        }
-        
-        li[index] = max(lp[index], ls[index]);
-        delta[index] = (lp[index] >= ls[index]) ? SA[rp[index]] - index: SA[rs[index]] - index;
+        lp = LCP[rmq ( min((int)invSA[i],rp)+1, max(rp,(int)invSA[i]) )];
     }
+            
+    if( rs > -1 )
+    {
+        ls = LCP[rmq ( min((int)invSA[i],rs)+1, max(rs,(int)invSA[i]) )];
+    }
+        
+    li = max(lp, ls);
+        
+        /*if( li[index] == 0)
+        {
+            delta[index] = 0;
+        }
+        else if (lp[index] == li[index] && SA[rp[index]] - index == 0)
+        {
+            delta[index] = 0;
+        }
+        else if (ls[index] == li[index] && SA[rs[index]] - index == 0)
+        {
+            delta[index] = 0;
+        }
+        else */
+        
+    delta = (lp >= ls) ? SA[rp] - index : SA[rs] - index;
     
-   /* cout<<"ls "<<endl;
+    
+  /* cout<<"ls "<<endl;
     for(int i = 0;  i<seq_y_len; i++)
     {
         cout<<ls[i]<<" ";
@@ -115,51 +122,42 @@ int compute_delta(int * delta, int * li, int * rp, int * rs, int64_t * SA, int64
     }
     cout<<endl;*/
     
-    delete[] lp;
-    delete[] ls;
-    
     return 0;
 }
     
-int compute_rp(set<int> ** W, int * rp, int64_t * invSA, int seq_x_len, int seq_y_len, int seq_xy_len)
+int compute_rp(set<int> &W, int64_t * invSA, int seq_x_len, int seq_xy_len, int i)
 {
 
-    for(int i = seq_x_len+1;  i<seq_xy_len; i++)
+    int rp = 0;
+    
+    auto it = W.upper_bound(invSA[i]);
+    if (it == W.begin())
     {
-        int index = i-(seq_x_len+1);
-        
-        auto it = W[index]->upper_bound(invSA[i]);
-        if (it == W[index]->begin())
-        {
-            rp[index] = -1;
-        }
-        else
-        {
-            --it;
-            rp[index] = *it;
-        }
+        rp = -1;
+    }
+    else
+    {
+        --it;
+        rp = *it;
     }
     
-    return 0;
+    return rp;
 }
 
 
-int compute_rs(set<int> ** W, int * rs, int64_t * invSA, int seq_x_len, int seq_y_len, int seq_xy_len)
+int compute_rs(set<int> &W, int64_t * invSA, int seq_x_len, int seq_xy_len, int i)
 {
     
-    for(int i = seq_x_len+1;  i<seq_xy_len; i++)
-    {
-        int index = i-(seq_x_len+1);
-        
-        auto it = W[index]->upper_bound(invSA[i]);
-        if (it == W[index]->end())
-        {
-            rs[index] = -1;
-        }
-        else rs[index] = *it;
-    }
+    int rs = 0;
     
-    return 0;
+    auto it = W.upper_bound(invSA[i]);
+    if (it == W.end())
+    {
+       rs = -1;
+    }
+    else rs = *it;
+    
+    return rs;
 }
 
 
@@ -219,17 +217,12 @@ unsigned char* readFile(const char * filename, std::streamsize& size)
     return sequence;
 }
 
-int compute_W(set<int> ** W, int seq_x_len, int seq_y_len, int64_t * invSA, int d)
+int compute_W(set<int> &W, int seq_x_len, int64_t * invSA, int d, int i)
 {
 
-    for(int i = 0; i<seq_y_len; i++)
-    {
-        for(int j=max(0,i-d); j<=min(seq_x_len-1,i+d); j++)
-        {
-            W[i]->insert(invSA[j]);
-        }
-    }
-
+    for(int j=max(0,i-d); j<=min(seq_x_len-1,i+d); j++)
+        W.insert(invSA[j]);
+       
     return 0;
 }
 
@@ -291,9 +284,6 @@ int main(int argc, char** argv)
     streamsize size_y;
     unsigned char * seq_y = readFile(y.c_str(), size_y);
 
-    auto end = chrono::high_resolution_clock::now();
-    auto elapsed = chrono::duration_cast<chrono::milliseconds>(end - start);
-
     int seq_x_len = strlen((char*) seq_x);
     int seq_y_len = strlen((char*) seq_y);
     
@@ -322,14 +312,35 @@ int main(int argc, char** argv)
     
 	LCParray( seq_xy, seq_xy_len, SA, invSA, LCP );
 	
-    set<int> * W[seq_y_len];
+	int_vector<> lcp_rmq( seq_xy_len , 0 );
+
+	for ( int i = 0; i < seq_xy_len; i ++ )
+	{
+		lcp_rmq[i] = LCP[i];
+	}
+	
+	rmq_succinct_sct<> rmq(&lcp_rmq);
+	
+	/* cout<<"SA"<<endl;
+	for(int a= 0; a<seq_xy_len; a++)
+    {
+        cout<<SA[a]<<endl;
+     }
+     
+     	 cout<<"LCP"<<endl;
+     for(int a= 0; a<seq_xy_len; a++)
+    {
+        cout<<LCP[a]<<endl;
+     }
+     
+     	 cout<<"invSA"<<endl;
+     for(int a= 0; a<seq_xy_len; a++)
+    {
+        cout<<invSA[a]<<endl;
+     }*/
+	
     
-    for(int i = 0; i<seq_y_len; i++)
-            W[i] = new set<int>;
-    
-    compute_W(W, seq_x_len, seq_y_len, invSA, d);
-    
-   /* cout<<" W "<<endl;
+    /*cout<<" W "<<endl;
     for(int a= 0; a<seq_y_len; a++)
     {
          for (auto x : *W[a])
@@ -338,53 +349,37 @@ int main(int argc, char** argv)
          }
          cout<<endl;
     }*/
+    ofstream out(output);
     
-    int * rp = new int[seq_y_len];
-    int * rs = new int[seq_y_len];
+    set<int> W;
+    int rp = 0;
+    int rs = 0;
+    int delta = 0;
+    int li = 0;
     
-    compute_rp(W, rp, invSA, seq_x_len, seq_y_len, seq_xy_len);
-    compute_rs(W, rs, invSA, seq_x_len, seq_y_len, seq_xy_len);
-
-    /* cout<<" rp "<<endl;
-    for(int a= 0; a<seq_y_len; a++)
-    {
+    for(int i = 0; i<seq_y_len; i++)
+    { 
+        int index = seq_x_len+1+i;
+        compute_W(W, seq_x_len, invSA, d, i);
+        rp = compute_rp(W, invSA, seq_x_len, seq_xy_len, index);
+        rs = compute_rs(W, invSA, seq_x_len, seq_xy_len, index);
+        compute_delta(rmq, delta, li, rp, rs, SA, invSA, LCP, seq_x_len, seq_y_len, seq_xy_len, index);
         
-         cout<<rp[a]<<endl;
+        out<<li<<endl;
+        
+        W.clear();
     }
     
-    
-    cout<<" rs "<<endl;
-    for(int a= 0; a<seq_y_len; a++)
-    {
-        
-         cout<<rs[a]<<endl;
-    }*/
-    
-    int * delta = new int[seq_y_len];
-    int * li = new int[seq_y_len];
-    
-    compute_delta(delta, li, rp, rs, SA, invSA, LCP, seq_x_len, seq_y_len, seq_xy_len);
-        
-    ofstream out(output);
-
-    for(int i = 0; i<seq_y_len; i++)
-        out<<li[i]<<" "<<delta[i]<<endl;
-        
+    auto end = chrono::high_resolution_clock::now();
+    auto elapsed = chrono::duration_cast<chrono::milliseconds>(end - start);
     cout<< "Elapsed time: " << elapsed.count() << " ms\n";
 
     delete[] seq_x;
     delete[] seq_y;
     delete[] seq_xy;
-    delete[] rp;
-    delete[] rs;
-    delete[] delta;
-    delete[] li;
     free( SA );
     free( LCP );
     free( invSA );
-   
-    for (int i = 0; i < seq_y_len; i++)
-        delete W[i];
    
     return 0;
 }
