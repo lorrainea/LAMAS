@@ -83,44 +83,7 @@ int compute_delta(rmq_succinct_sct<> &rmq, int &delta, int &li, int rp, int rs, 
     }
         
     li = max(lp, ls);
-        
-        /*if( li[index] == 0)
-        {
-            delta[index] = 0;
-        }
-        else if (lp[index] == li[index] && SA[rp[index]] - index == 0)
-        {
-            delta[index] = 0;
-        }
-        else if (ls[index] == li[index] && SA[rs[index]] - index == 0)
-        {
-            delta[index] = 0;
-        }
-        else */
-        
     delta = (lp >= ls) ? SA[rp] - index : SA[rs] - index;
-    
-    
-  /* cout<<"ls "<<endl;
-    for(int i = 0;  i<seq_y_len; i++)
-    {
-        cout<<ls[i]<<" ";
-    }
-    cout<<endl;
-    
-    cout<<"lp "<<endl;
-    for(int i = 0;  i<seq_y_len; i++)
-    {
-        cout<<lp[i]<<" ";
-    }
-    cout<<endl;
-    
-    cout<<"delta "<<endl;
-    for(int i = 0;  i<seq_y_len; i++)
-    {
-        cout<<delta[i]<<" ";
-    }
-    cout<<endl;*/
     
     return 0;
 }
@@ -320,35 +283,6 @@ int main(int argc, char** argv)
 	}
 	
 	rmq_succinct_sct<> rmq(&lcp_rmq);
-	
-	/* cout<<"SA"<<endl;
-	for(int a= 0; a<seq_xy_len; a++)
-    {
-        cout<<SA[a]<<endl;
-     }
-     
-     	 cout<<"LCP"<<endl;
-     for(int a= 0; a<seq_xy_len; a++)
-    {
-        cout<<LCP[a]<<endl;
-     }
-     
-     	 cout<<"invSA"<<endl;
-     for(int a= 0; a<seq_xy_len; a++)
-    {
-        cout<<invSA[a]<<endl;
-     }*/
-	
-    
-    /*cout<<" W "<<endl;
-    for(int a= 0; a<seq_y_len; a++)
-    {
-         for (auto x : *W[a])
-         {
-            cout << x << " ";
-         }
-         cout<<endl;
-    }*/
     ofstream out(output);
     
     set<int> W;
