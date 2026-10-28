@@ -5,5 +5,3 @@ cd sdsl-lite
 ./install.sh "$(pwd)"/libsdsl
 mv libsdsl/ ..
 cd ..
-
-gunzip boost.zip

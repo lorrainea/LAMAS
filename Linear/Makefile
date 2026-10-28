@@ -9,7 +9,7 @@ EXE = lamas
 SRC = lamas.cc
 OBJ = $(SRC:.cc=.o)
 
-HD = lamas.h Makefile
+HD = Makefile
 
 .SUFFIXES:
 .SUFFIXES: .cc .o
