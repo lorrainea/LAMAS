@@ -1,0 +1,27 @@
+{
+  "files": 1,
+  "seq_pairs": 200,
+  "total_bases": 4431946,
+  "length": {
+    "min": 755,
+    "max": 48233,
+    "mean": 11079.865000000005,
+    "stddev": 11389.97083893435
+  },
+  "divergence": {
+    "min": 0.09261838440111421,
+    "max": 0.09545253211280083,
+    "mean": 0.09408715378255444,
+    "stddev": 0.0006851867758433293
+  },
+  "largest_gap": {
+    "min": 4,
+    "max": 436,
+    "mean": 56.61,
+    "stddev": 63.0108554139682
+  },
+  "edit_distance": 216502,
+  "substitutions": 51952,
+  "insertions": 69070,
+  "deletions": 95480
+}
