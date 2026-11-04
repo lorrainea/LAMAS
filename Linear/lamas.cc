@@ -1,444 +1,372 @@
-#include <stdio.h>
-#include <cstring>
-#include <unistd.h>
-#include <stdlib.h>
-#include <fstream>
-#include <sstream>
 #include <algorithm>
+#include <array>
+#include <charconv>
 #include <chrono>
-#include <iostream>
-#include <string>
 #include <climits>
+#include <cstdint>
+#include <cstring>
+#include <fstream>
+#include <iostream>
+#include <numeric>
+#include <stdexcept>
+#include <string>
 #include <vector>
-#include <divsufsort64.h>             
-#include <sdsl/bit_vectors.hpp>               
-#include <sdsl/rmq_support.hpp>	
-#include <sdsl/rmq_support_sparse_table.hpp>
+#include <unistd.h>
+#include <divsufsort.h>
+#include <sdsl/rmq_support.hpp>
 
-using namespace std;
-using namespace sdsl;
+namespace lamas {
 
-void usage(void)
-{
-    fprintf(stderr, "lamas\n");
-    fprintf(stderr, "  -x <seq_x_filename> input sequence file.\n");
-    fprintf(stderr, "  -y <seq_y_filename> input sequence file.\n");
-    fprintf(stderr, "  -d <d_range> range of d.\n");
-    fprintf(stderr, "  -o <output_filename> output file\n");
-    exit(0);
-}
+using index_type = saidx_t;
+static_assert(sizeof(index_type) == 4, "LAMAS requires 32-bit divsufsort indices");
+constexpr index_type no_match = INT_MIN; // Preserve the existing empty-window output.
 
-/* Kasai et al algorithm for O(n)-time LCP construction */
-int64_t LCParray (unsigned char * text, int64_t n, int64_t * SA, int64_t * ISA, int64_t * LCP)
-{
-    int64_t i=0, j=0;
-
-    LCP[0] = 0;
-    for ( i = 0; i < n; i++ )
-    {
-        if ( ISA[i] != 0 )
-        {
-            if ( i == 0 )
-            {
-                j = 0;
-            }
-            else j = (LCP[ISA[i-1]] >= 2) ? LCP[ISA[i-1]]-1 : 0;
-            
-            while ( text[i+j] == text[SA[ISA[i]-1]+j] )
-            {
-                j++;
-            }
-            LCP[ISA[i]] = j;
-        }
+/* Deletion-only predecessor/successor with sentinels. Each index is erased
+ * once; the two forests compress paths. This is the same practical interval
+ * union-find scheme as the original implementation, not a new strict-linear
+ * worst-case interval-union-find construction. */
+struct DeletionOnlySet {
+    std::vector<index_type> nxt, prv;
+    void init(index_type size) {
+        nxt.resize(static_cast<size_t>(size) + 1);
+        prv.resize(static_cast<size_t>(size) + 1);
+        std::iota(nxt.begin(), nxt.end(), 0);
+        std::iota(prv.begin(), prv.end(), 0);
     }
-   
-    return 0;
-}
-
-
-/*
- * Deletion-only set over the indices [0, m), all initially present, supporting
- *   erase(k)  : mark index k as deleted,
- *   next(k)   : smallest present index k' >= k (or m if none),
- *   prev(k)   : largest present index k' <= k (or -1 if none).
- * Implemented as two union-find forests with path compression (one pointing
- * right, one pointing left). This is the "interval union-find" problem; the
- * simple path-compression version below is near-linear in practice.
- */
-struct DeletionOnlySet
-{
-    int m;
-    vector<int> nxt;   /* nxt[k] == k iff k is present; nxt[m] = m is a sentinel      */
-    vector<int> prv;   /* stored with an offset of 1: prv[k+1]; prv[0] = 0 is a sentinel (-1) */
-
-    void init(int size)
-    {
-        m = size;
-        nxt.resize(m + 1);
-        prv.resize(m + 2);
-        for (int k = 0; k <= m; ++k) nxt[k] = k;
-        for (int k = 0; k <= m + 1; ++k) prv[k] = k;
-    }
-
-    int next(int k)
-    {
-        int r = k;
+    index_type next(index_type k) {
+        index_type r = k;
         while (nxt[r] != r) r = nxt[r];
-        while (nxt[k] != r) { int t = nxt[k]; nxt[k] = r; k = t; }   /* path compression */
-        return r;                                                   /* r == m means "none" */
+        while (nxt[k] != r) { const auto t = nxt[k]; nxt[k] = r; k = t; }
+        return r;
     }
-
-    int prev(int k)
-    {
-        int s = k + 1;
-        int r = s;
+    index_type prev(index_type k) {
+        index_type s = k + 1, r = s;
         while (prv[r] != r) r = prv[r];
-        while (prv[s] != r) { int t = prv[s]; prv[s] = r; s = t; }
-        return r - 1;                                               /* -1 means "none" */
+        while (prv[s] != r) { const auto t = prv[s]; prv[s] = r; s = t; }
+        return r - 1;
     }
-
-    void erase(int k)
-    {
+    void erase(index_type k) {
         nxt[k] = k + 1;
         prv[k + 1] = k;
     }
 };
 
-/*
- * Linear-time LAMAS (Section 3.5 of the paper).
+struct SuffixIndex {
+    std::vector<index_type> sa, isa, lcp;
+    static constexpr index_type rmq_block = 32;
+    std::vector<index_type> block_min;
+    sdsl::rmq_succinct_sct<> rmq;
+
+    explicit SuffixIndex(const std::vector<unsigned char>& text) {
+        if (text.empty() || text.size() > static_cast<size_t>(INT_MAX))
+            throw std::length_error("combined sequence length must be in [1, INT_MAX]");
+        const auto n = static_cast<index_type>(text.size());
+        sa.resize(n);
+        if (divsufsort(text.data(), sa.data(), n) != 0)
+            throw std::runtime_error("suffix-array construction failed");
+        isa.resize(n);
+        for (index_type r = 0; r < n; ++r) isa[sa[r]] = r;
+        lcp.resize(n);
+        // Kasai: retain h in a register instead of reloading the preceding LCP.
+        index_type h = 0;
+        for (index_type i = 0; i < n; ++i) {
+            const auto r = isa[i];
+            if (r == 0) { h = 0; continue; }
+            const auto j = sa[r - 1];
+            const auto limit = n - std::max(i, j);
+            while (h < limit && text[i + h] == text[j + h]) ++h;
+            lcp[r] = h;
+            if (h) --h;
+        }
+        // RMQ only over minima of fixed-size blocks. An LCE scans at most two
+        // boundary blocks and makes at most one succinct query, still O(1).
+        // This shrinks RMQ construction and improves its cache locality.
+        block_min.resize(1 + (n - 1) / rmq_block, INT_MAX);
+        for (index_type r = 0; r < n; ++r)
+            block_min[r / rmq_block] = std::min(block_min[r / rmq_block], lcp[r]);
+        rmq = sdsl::rmq_succinct_sct<>(&block_min);
+    }
+
+    index_type lce(index_type a, index_type b, index_type best = -1) const {
+        if (a > b) std::swap(a, b);
+        ++a; // LCP minimum on (a_old,b]. The ranks are always distinct.
+        // Both endpoints are upper bounds on the minimum. A candidate that
+        // cannot improve the current answer needs no RMQ query.
+        index_type bound = std::min(lcp[a], lcp[b]);
+        if (bound <= best || a == b) return bound;
+        // A fixed-size scan avoids succinct-RMQ overhead on very short ranges.
+        if (b - a < 8) {
+            for (index_type r = a + 1; r < b; ++r) bound = std::min(bound, lcp[r]);
+            return bound;
+        }
+        const index_type first = a / rmq_block, last = b / rmq_block;
+        if (first == last) {
+            for (index_type r = a + 1; r < b; ++r) bound = std::min(bound, lcp[r]);
+            return bound;
+        }
+        const index_type left_end = (first + 1) * rmq_block; // <= b, no overflow
+        for (index_type r = a + 1; r < left_end; ++r) bound = std::min(bound, lcp[r]);
+        for (index_type r = last * rmq_block; r < b; ++r) bound = std::min(bound, lcp[r]);
+        if (bound <= best || first + 1 == last) return bound;
+        return std::min(bound, block_min[rmq(first + 1, last - 1)]);
+    }
+};
+
+/* For each Y position emit (i, predecessor rank, successor rank).
+ * Missing ranks are -1 and n. The window is inclusive: [i-d,i+d].
  *
- * Notation: S = X ~ Y; SA/invSA/LCP are those of S; A[k] = invSA[k] for k in [0,|X|) and
- * B[i] = invSA[|X|+1+i] for i in [0,|Y|). For every i we need the predecessor and the
- * successor of B[i] among the values A[max(0,i-d) .. min(|X|-1,i+d)]. Y is cut into blocks
- * of d positions; block b (Y positions [bd,(b+1)d)) only looks at the A positions
- * [(b-1)d, (b+2)d), which we index locally by j in [0,3d). The window of the local
- * position i' is [i', i'+2d] = [i', d) U [d, 2d) U [2d, 2d+i'], i.e. a suffix of the
- * "left" third, the whole "middle" third and a prefix of the "right" third. The middle
- * part is static; the left and right parts are deletion-only predecessor problems.
- * Sorting the elements of every block by rank is done by one global scan of SA.
+ * X and Y are each divided into physical blocks of d positions. One SA scan
+ * stores each relevant suffix rank ONCE, in its own sorted block. Query block
+ * b reuses X blocks b-1, b, b+1 (left suffix, static middle, right prefix).
+ * Three linear merges give insertion points in those lists; the two moving
+ * parts use deletion-only sets. All block-local arrays are reused.
  */
-template<class RMQ>
-int compute_lamas(int seq_x_len, int seq_y_len, int d, const int64_t * SA, const int64_t * invSA,
-                  const int64_t * LCP, RMQ & rmq, const string & output_file)
-{
-    ofstream out(output_file);
-
-    if (seq_y_len <= 0) return 0;
-
-    /* LCP of the suffixes of S with (distinct) ranks r1 and r2 */
-    auto lcp_ranks = [&](int64_t r1, int64_t r2) -> int64_t
-    {
-        if (r1 > r2) swap(r1, r2);
-        return LCP[rmq(r1 + 1, r2)];
-    };
-
-    /* Report the answer for Y position i given the X positions holding the
-       predecessor and the successor rank (-1 if undefined).                 */
-    auto report = [&](int i, int64_t pred_pos, int64_t succ_pos)
-    {
-        int64_t rank = invSA[seq_x_len + 1 + i];
-        int64_t lp = INT_MIN, ls = INT_MIN;
-        int64_t li, delta;
-
-        if (pred_pos >= 0) lp = lcp_ranks(rank, invSA[pred_pos]);
-        if (succ_pos >= 0) ls = lcp_ranks(rank, invSA[succ_pos]);
-
-        if (pred_pos < 0 && succ_pos < 0)
-        {
-            li = INT_MIN;
-            delta = INT_MIN;
+template<class Emit>
+void neighbors(index_type nx, index_type ny, index_type d,
+               const std::vector<index_type>& sa,
+               const std::vector<index_type>& isa, Emit emit) {
+    const auto n = static_cast<index_type>(sa.size());
+    if (ny == 0) return;
+    if (d == 0) {
+        for (index_type i = 0; i < ny; ++i) {
+            const auto r = isa[nx + 1 + i];
+            const auto a = i < nx ? isa[i] : -1;
+            emit(i, a >= 0 && a < r ? a : -1, a > r ? a : n);
         }
-        else
-        {
-            li = max(lp, ls);
-            delta = (lp >= ls ? pred_pos : succ_pos) - i;
-        }
-
-        (void) delta;                 /* delta is computed for the two-column output below */
-        //out<<li<<" "<<delta<<'\n';
-        out<<li<<'\n';
-    };
-
-    /* Any d >= max(|X|,|Y|) yields the same windows as d = max(|X|,|Y|). */
-    d = min(d, max(seq_x_len, seq_y_len));
-
-    if (d == 0)
-    {
-        for (int i = 0; i < seq_y_len; ++i)
-            report(i, (i < seq_x_len ? i : -1), -1);
-        return 0;
+        return;
     }
-
-    const int nb = (seq_y_len + d - 1) / d;   /* number of blocks of Y */
-
-    /* ---- Step A: bucket the elements of every block, sorted by rank, by one scan of SA. ---- */
-    vector<int64_t> off(nb + 1, 0);
-    for (int b = 0; b < nb; ++b)
+    d = std::min(d, std::max(nx, ny));
+    // X suffixes starting beyond the last possible window are never needed.
+    const auto used_x = static_cast<index_type>(std::min<int64_t>(nx, int64_t(ny) + d));
+    const auto xb = used_x ? 1 + (used_x - 1) / d : 0;
+    const auto yb = 1 + (ny - 1) / d;
+    std::vector<index_type> sorted(static_cast<size_t>(used_x) + ny);
     {
-        int64_t aBase = (int64_t) (b - 1) * d;
-        int64_t aL = max<int64_t>(0, aBase), aR = min<int64_t>(seq_x_len, aBase + 3 * (int64_t) d);
-        int64_t yL = (int64_t) b * d, yR = min<int64_t>(seq_y_len, yL + d);
-        off[b + 1] = off[b] + max<int64_t>(0, aR - aL) + (yR - yL);   /* blocks beyond the end of X have no A elements */
-    }
-    vector<int> buf(off[nb]);                 /* positions in S, grouped by block, sorted by rank */
-    {
-        vector<int64_t> fill(off.begin(), off.end() - 1);
-        int64_t seq_xy_len = (int64_t) seq_x_len + seq_y_len + 1;
-        for (int64_t r = 0; r < seq_xy_len; ++r)
-        {
-            int64_t p = SA[r];
-            if (p < seq_x_len)
-            {
-                int b0 = (int) (p / d);
-                for (int b = max(0, b0 - 1); b <= min(nb - 1, b0 + 1); ++b)
-                    buf[fill[b]++] = (int) p;
-            }
-            else if (p > seq_x_len)
-            {
-                int b = (int) ((p - seq_x_len - 1) / d);
-                buf[fill[b]++] = (int) p;
-            }
+        std::vector<index_type> fill(static_cast<size_t>(xb) + yb);
+        for (index_type b = 0; b < xb; ++b) fill[b] = b * d;
+        for (index_type b = 0; b < yb; ++b) fill[xb + b] = used_x + b * d;
+        for (index_type r = 0; r < n; ++r) {
+            const auto p = sa[r];
+            if (p < used_x) sorted[fill[p / d]++] = r;
+            else if (p > nx) sorted[fill[xb + (p - nx - 1) / d]++] = r;
         }
     }
-
-    /* ---- Step B: solve every block. ---- */
-    vector<int> rho(3 * (size_t) d);                     /* rank of A element (local index j) within its third */
-    vector<int> cL, cM, cR;                              /* sorted (by rank) X positions of the three thirds   */
-    vector<int> piL(d), piM(d), piR(d);                  /* # elements of each third smaller than B[i']        */
-    vector<int> predL(d), succL(d), predR(d), succR(d);  /* answers for the left/right thirds (X positions)     */
+    const auto capacity = std::min(d, ny);
+    std::vector<index_type> pred(capacity), succ(capacity), pi(capacity);
+    std::vector<index_type> rho(std::min(d, used_x));
     DeletionOnlySet ds;
-    cL.reserve(d); cM.reserve(d); cR.reserve(d);
 
-    for (int b = 0; b < nb; ++b)
-    {
-        int64_t aBase = (int64_t) (b - 1) * d;
-        int64_t aL = max<int64_t>(0, aBase), aR = min<int64_t>(seq_x_len, aBase + 3 * (int64_t) d);
-        int64_t yL = (int64_t) b * d, yR = min<int64_t>(seq_y_len, yL + d);
-        int len = (int) (yR - yL);
+    for (index_type b = 0; b < yb; ++b) {
+        const auto ystart = b * d;
+        const auto len = std::min(d, ny - ystart);
+        const auto* queries = sorted.data() + used_x + ystart;
+        std::fill_n(pred.begin(), len, -1);
+        std::fill_n(succ.begin(), len, n);
 
-        /* exists(j): does local A index j correspond to a position of X? */
-        auto exists = [&](int j) -> bool { int64_t p = aBase + j; return p >= aL && p < aR; };
-
-        cL.clear(); cM.clear(); cR.clear();
-
-        for (int64_t t = off[b]; t < off[b + 1]; ++t)
-        {
-            int p = buf[t];
-            if (p < seq_x_len)
-            {
-                int j = (int) (p - aBase);
-                if      (j <  d)     { rho[j] = (int) cL.size(); cL.push_back(p); }
-                else if (j < 2 * d)  { rho[j] = (int) cM.size(); cM.push_back(p); }
-                else                 { rho[j] = (int) cR.size(); cR.push_back(p); }
+        // Merge queries with one sorted X block. For a moving part also record
+        // each X position's local rank and each Y position's insertion point.
+        auto part = [&](int64_t xstart64, int kind) {
+            if (xstart64 < 0 || xstart64 >= used_x) return;
+            const auto xstart = static_cast<index_type>(xstart64);
+            const auto count = std::min(d, used_x - xstart);
+            const auto* ranks = sorted.data() + xstart;
+            if (kind != 0) {
+                for (index_type k = 0; k < count; ++k)
+                    rho[sa[ranks[k]] - xstart] = k;
             }
-            else
-            {
-                int ip = (int) (p - seq_x_len - 1 - yL);
-                piL[ip] = (int) cL.size(); piM[ip] = (int) cM.size(); piR[ip] = (int) cR.size();
+            index_type k = 0;
+            for (index_type q = 0; q < len; ++q) {
+                const auto rank = queries[q];
+                const auto ip = sa[rank] - nx - 1 - ystart;
+                while (k < count && ranks[k] < rank) ++k;
+                if (kind == 0) {
+                    if (k) pred[ip] = ranks[k - 1];
+                    if (k < count) succ[ip] = ranks[k];
+                } else pi[ip] = k;
+            }
+            if (kind == 0) return;
+            ds.init(count);
+            auto query = [&](index_type ip) {
+                const auto p = ds.prev(pi[ip] - 1);
+                const auto s = ds.next(pi[ip]);
+                if (p >= 0) pred[ip] = std::max(pred[ip], ranks[p]);
+                if (s < count) succ[ip] = std::min(succ[ip], ranks[s]);
+            };
+            if (kind < 0) { // left suffix [ip,d)
+                for (index_type ip = 0; ip < len; ++ip) {
+                    query(ip);
+                    if (ip < count) ds.erase(rho[ip]);
+                }
+            } else { // right prefix [0,ip], including its last position
+                for (index_type j = len; j < count; ++j) ds.erase(rho[j]);
+                for (index_type ip = len; ip-- > 0;) {
+                    query(ip);
+                    if (ip < count) ds.erase(rho[ip]);
+                }
+            }
+        };
+        part(ystart, 0);
+        part(int64_t(ystart) - d, -1);
+        part(int64_t(ystart) + d, 1);
+        for (index_type ip = 0; ip < len; ++ip)
+            emit(ystart + ip, pred[ip], succ[ip]);
+    }
+}
+
+template<class Emit>
+void solve_indexed(index_type nx, index_type ny, index_type d,
+                   const SuffixIndex& index, Emit emit) {
+    const auto n = static_cast<index_type>(index.sa.size());
+    neighbors(nx, ny, d, index.sa, index.isa,
+        [&](index_type i, index_type pred, index_type succ) {
+            if (pred < 0 && succ == n) { emit(no_match); return; }
+            const auto rank = index.isa[nx + 1 + i];
+            index_type best = -1;
+            if (pred >= 0) best = index.lce(pred, rank);
+            if (succ < n) best = std::max(best, index.lce(rank, succ, best));
+            emit(best);
+        });
+}
+
+/* d=0 needs only aligned runs, so bypass suffix preprocessing entirely. */
+template<class Emit>
+void solve_zero(const std::vector<unsigned char>& text, index_type nx,
+                index_type ny, Emit emit) {
+    index_type i = 0;
+    const auto overlap = std::min(nx, ny);
+    while (i < overlap) {
+        if (text[i] != text[nx + 1 + i]) { emit(0); ++i; continue; }
+        const auto start = i;
+        while (i < overlap && text[i] == text[nx + 1 + i]) ++i;
+        for (index_type run = i - start; run > 0; --run) emit(run);
+    }
+    while (i++ < ny) emit(no_match);
+}
+
+/* With a fixed small radius, a bounded number of diagonal scans is faster
+ * than suffix preprocessing. Along diagonal delta, LCE(i,i+delta) is one plus
+ * the next LCE if the symbols match, and zero otherwise. The threshold is a
+ * constant, so this branch remains O(nx+ny) time and uses only ny integers. */
+constexpr index_type direct_radius = 16;
+template<class Emit>
+void solve_small(const std::vector<unsigned char>& text, index_type nx,
+                 index_type ny, index_type d, Emit emit) {
+    if (d < 0 || d > direct_radius)
+        throw std::invalid_argument("direct solver radius exceeds fixed threshold");
+    std::vector<index_type> answer(ny, no_match);
+    for (index_type delta = -d; delta <= d; ++delta) {
+        const auto begin = std::max<index_type>(0, -delta);
+        const auto end = static_cast<index_type>(std::min<int64_t>(ny, int64_t(nx) - delta));
+        index_type length = 0;
+        for (index_type i = end; i > begin;) {
+            --i;
+            length = text[i + delta] == text[nx + 1 + i] ? length + 1 : 0;
+            answer[i] = std::max(answer[i], length);
+        }
+    }
+    for (const auto value : answer) emit(value);
+}
+
+// Append filtered input directly to the one concatenated text buffer. Newline
+// is a safe separator because all input newlines are removed. No strlen/strcpy:
+// embedded NUL and '~' are ordinary symbols and cannot truncate/cross X.
+void read_append(const std::string& filename, std::vector<unsigned char>& text) {
+    std::ifstream in(filename, std::ios::binary);
+    if (!in) throw std::runtime_error("failed to open input: " + filename);
+    std::array<char, 65536> buffer;
+    while (in.read(buffer.data(), buffer.size()) || in.gcount()) {
+        for (std::streamsize i = 0; i < in.gcount(); ++i) {
+            const auto c = static_cast<unsigned char>(buffer[i]);
+            if (c == ' ' || c == '\n' || c == '\r' || c == '\t') continue;
+            if (text.size() == static_cast<size_t>(INT_MAX))
+                throw std::length_error("combined sequence length exceeds INT_MAX");
+            text.push_back(c);
+        }
+    }
+    if (in.bad() || !in.eof()) throw std::runtime_error("failed to read input: " + filename);
+}
+
+class Output {
+    std::ofstream out;
+    std::array<char, 65536> buffer;
+    size_t used = 0;
+    void flush() {
+        out.write(buffer.data(), static_cast<std::streamsize>(used));
+        if (!out) throw std::runtime_error("failed to write output");
+        used = 0;
+    }
+public:
+    explicit Output(const std::string& filename) : out(filename, std::ios::binary) {
+        if (!out) throw std::runtime_error("failed to open output: " + filename);
+    }
+    void operator()(index_type value) {
+        if (buffer.size() - used < 16) flush();
+        auto result = std::to_chars(buffer.data() + used, buffer.data() + buffer.size(), value);
+        used = static_cast<size_t>(result.ptr - buffer.data());
+        buffer[used++] = '\n';
+    }
+    void finish() {
+        flush();
+        out.close();
+        if (!out) throw std::runtime_error("failed to close output");
+    }
+};
+
+} // namespace lamas
+
+#ifndef LAMAS_NO_MAIN
+int main(int argc, char** argv) {
+    try {
+        std::string x, y, output;
+        int d = -1, opt;
+        while ((opt = getopt(argc, argv, "x:y:d:o:h")) != -1) {
+            switch (opt) {
+                case 'x': x = optarg; break;
+                case 'y': y = optarg; break;
+                case 'o': output = optarg; break;
+                case 'd': {
+                    const auto end = optarg + std::strlen(optarg);
+                    const auto parsed = std::from_chars(optarg, end, d);
+                    if (parsed.ec != std::errc{} || parsed.ptr != end || d < 0)
+                        throw std::invalid_argument("-d must be an integer in [0, INT_MAX]");
+                    break;
+                }
+                case 'h':
+                    std::cout << "lamas -x <sequence> -y <sequence> -d <radius> -o <output>\n";
+                    return 0;
+                default: throw std::invalid_argument("invalid command-line option");
             }
         }
-
-        /* Right third: prefix [2d, 2d+i'], processed for decreasing i' with deletions. */
-        ds.init((int) cR.size());
-        for (int j = 2 * d + len; j < 3 * d; ++j)
-            if (exists(j)) ds.erase(rho[j]);
-        for (int ip = len - 1; ip >= 0; --ip)
-        {
-            int s = ds.next(piR[ip]);
-            succR[ip] = (s < (int) cR.size()) ? cR[s] : -1;
-            int q = (piR[ip] > 0) ? ds.prev(piR[ip] - 1) : -1;
-            predR[ip] = (q >= 0) ? cR[q] : -1;
-            if (exists(2 * d + ip)) ds.erase(rho[2 * d + ip]);
+        if (x.empty() || y.empty() || output.empty() || d < 0 || optind != argc)
+            throw std::invalid_argument("usage: lamas -x <sequence> -y <sequence> -d <radius> -o <output>");
+        const auto start = std::chrono::steady_clock::now();
+        std::vector<unsigned char> text;
+        lamas::read_append(x, text);
+        if (text.size() == static_cast<size_t>(INT_MAX))
+            throw std::length_error("combined sequence length exceeds INT_MAX");
+        const auto nx = static_cast<lamas::index_type>(text.size());
+        text.push_back('\n');
+        lamas::read_append(y, text);
+        const auto ny = static_cast<lamas::index_type>(text.size() - nx - 1);
+        lamas::Output out(output);
+        auto emit = [&](lamas::index_type value) { out(value); };
+        if (ny == 0) { /* Empty output. */ }
+        else if (nx == 0) { for (int i = 0; i < ny; ++i) emit(lamas::no_match); }
+        else if (d == 0) lamas::solve_zero(text, nx, ny, emit);
+        else if (d <= lamas::direct_radius) lamas::solve_small(text, nx, ny, d, emit);
+        else {
+            lamas::SuffixIndex index(text);
+            std::vector<unsigned char>().swap(text); // Release text before block workspace.
+            lamas::solve_indexed(nx, ny, d, index, emit);
         }
-
-        /* Left third: suffix [i', d), processed for increasing i' with deletions. */
-        ds.init((int) cL.size());
-        for (int ip = 0; ip < len; ++ip)
-        {
-            int s = ds.next(piL[ip]);
-            succL[ip] = (s < (int) cL.size()) ? cL[s] : -1;
-            int q = (piL[ip] > 0) ? ds.prev(piL[ip] - 1) : -1;
-            predL[ip] = (q >= 0) ? cL[q] : -1;
-            if (exists(ip)) ds.erase(rho[ip]);
-        }
-
-        /* Combine the three parts and report. */
-        for (int ip = 0; ip < len; ++ip)
-        {
-            int64_t predM = (piM[ip] > 0) ? cM[piM[ip] - 1] : -1;
-            int64_t succM = (piM[ip] < (int) cM.size()) ? cM[piM[ip]] : -1;
-
-            int64_t pred_pos = -1, succ_pos = -1;
-            for (int64_t cand : {(int64_t) predL[ip], predM, (int64_t) predR[ip]})
-                if (cand >= 0 && (pred_pos < 0 || invSA[cand] > invSA[pred_pos])) pred_pos = cand;
-            for (int64_t cand : {(int64_t) succL[ip], succM, (int64_t) succR[ip]})
-                if (cand >= 0 && (succ_pos < 0 || invSA[cand] < invSA[succ_pos])) succ_pos = cand;
-
-            report((int) (yL + ip), pred_pos, succ_pos);
-        }
+        out.finish();
+        const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - start);
+        std::cout << "Elapsed time: " << elapsed.count() << " ms\n";
+        return 0;
+    } catch (const std::exception& e) {
+        std::cerr << "Error: " << e.what() << '\n';
+        return 1;
     }
-
-    return 0;
 }
-
-unsigned char * concatenate(unsigned char * seq_x, unsigned char * seq_y, int seq_x_len, int seq_y_len)
-{
-    unsigned char * seq_xy = new unsigned char[seq_x_len + seq_y_len + 2];
-   
-    strcpy(reinterpret_cast<char*>(seq_xy), reinterpret_cast<char*>(seq_x));
-
-    int pos = seq_x_len;
-
-    seq_xy[pos] = '~';
-    seq_xy[pos+1] = '\0';
-    
-    strcat(reinterpret_cast<char*>(seq_xy),reinterpret_cast<char*>(seq_y));
-    
-    seq_xy[seq_x_len + seq_y_len + 1] = '\0';
-    
-    return seq_xy;
-}
-
-unsigned char* readFile(const char * filename, std::streamsize& size)
-{
-    ifstream file(filename, ios::binary);
-
-    if (!file)
-    {
-        fprintf(stderr, "Failed to open %s.\n", filename);
-        exit( EXIT_FAILURE );
-    }
-
-    vector<unsigned char> temp;
-
-    char ch;
-
-    while (file.get(ch))
-    {
-        if (ch == ' ' || ch == '\n' || ch == '\r' || ch == '\t')
-            continue;
-        
-        temp.push_back(static_cast<unsigned char>(ch));
-    }
-
-    size = temp.size();
-
-    unsigned char * sequence = new unsigned char[size+1];
-
-    for (int i = 0; i < size; i++)
-    {
-        sequence[i] = temp[i];
-    }
-    
-    sequence[size] = '\0';
-    temp.clear();
-    
-    return sequence;
-}
-
-int main(int argc, char** argv)
-{
-    string x;
-    string y;
-    string output;
-
-    int d = -1;
-
-    int opt;
-
-    while ((opt = getopt(argc, argv, "x:y:d:o:")) != -1)
-    {
-        switch (opt)
-        {
-            case 'x':
-                x = optarg;
-                break;
-
-            case 'y':
-                y = optarg;
-                break;
-
-            case 'd':
-            {
-                stringstream ss(optarg);
-                ss >> d;
-                break;
-            }
-
-            case 'o':
-                output = optarg;
-                break;
-
-            default:
-                usage();
-        }
-    }
-
-    if (d < 0)
-    {
-        fprintf(stderr, "Error: distance (-d) cannot be less than 0.\n");
-        usage();
-    }
-
-    if (output.empty())
-    {
-        fprintf(stderr, "Error: output file (-o) is required.\n");
-        usage();
-    }
-
-    auto start = chrono::high_resolution_clock::now();
-
-    streamsize size_x;
-    unsigned char * seq_x = readFile(x.c_str(), size_x);
-
-    streamsize size_y;
-    unsigned char * seq_y = readFile(y.c_str(), size_y);
-
-    int seq_x_len = strlen((char*) seq_x);
-    int seq_y_len = strlen((char*) seq_y);
-    
-    unsigned char * seq_xy = concatenate( seq_x, seq_y, seq_x_len, seq_y_len);
-    
-    int seq_xy_len = seq_x_len + seq_y_len + 1;
-    
-	int64_t * SA;
-	int64_t * LCP;
-	int64_t * invSA;
-	
-	SA = ( int64_t * ) malloc( ( seq_xy_len ) * sizeof( int64_t ) );
-	invSA = ( int64_t * ) calloc( seq_xy_len , sizeof( int64_t ) );
-	LCP = ( int64_t * ) calloc  ( seq_xy_len, sizeof( int64_t ) );
-
-  	if( divsufsort64( seq_xy, SA,  seq_xy_len ) != 0 )
-  	{
-  		fprintf(stderr, "Error: SA computation failed.\n" );
-        exit( EXIT_FAILURE );
-  	}
-	
-	for (int64_t i=0; i <seq_xy_len; i++)
-	    invSA[SA[i]] = i;        
-	
-	LCParray(seq_xy, seq_xy_len, SA, invSA, LCP);
-	
-	int_vector<> lcp_rmq(seq_xy_len , 0);
-
-	for ( int i = 0; i < seq_xy_len; i++ )
-	    lcp_rmq[i] = LCP[i];
-	
-	rmq_succinct_sct<> rmq(&lcp_rmq);
-
-    compute_lamas(seq_x_len, seq_y_len, d, SA, invSA, LCP, rmq, output);
-    
-    auto end = chrono::high_resolution_clock::now();
-    auto elapsed = chrono::duration_cast<chrono::milliseconds>(end - start);
-    cout<< "Elapsed time: " << elapsed.count() << " ms\n";
-
-    delete[] seq_x;
-    delete[] seq_y;
-    delete[] seq_xy;
-    free( SA );
-    free( LCP );
-    free( invSA );
-   
-    return 0;
-}
+#endif
