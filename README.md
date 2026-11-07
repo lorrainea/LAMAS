@@ -37,3 +37,4 @@ This project includes built-in scripts to benchmark LAMAS against standard basel
 * **`q-gram`**
 * **`ED`** (Edit Distance)
 * **`MS`** (Matching Statistics)
+* **`DTW (Banded)`** (Banded Dynamic Time Warping)
